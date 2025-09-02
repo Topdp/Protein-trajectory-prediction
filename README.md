@@ -1,2 +1,2 @@
-# Protein-trajectory-prediction
-进行中的项目用于对蛋白质轨迹进行预测,该模型基于egnn和mamba，对蛋白质的轨迹中的所有结构进行结构池化后获得特征嵌入，输入到mamba中进行时序预测。
+# PTGMamba: Protein-trajectory-prediction
+The ongoing project is based on the EGNN and Mamba models, aiming to predict the molecular dynamics trajectories (MD) of proteins, using GNN to map all the structures in the protein trajectories, embed them with features and obtain pooled vectors, and input them into Mamba to learn to predict future frames through the selection of state space (SSM) modules
