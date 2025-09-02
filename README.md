@@ -4,12 +4,12 @@ The ongoing project is based on the EGNN and Mamba models, aiming to predict the
 ## Model Architecture
 
 
-## The model used
+### Model used
 - E(n) Equivariant Graph Neural Networks (EGNN)
 - Mamba: Linear-Time Sequence Modeling with Selective State Spaces (Mamba)
 - Attention Mechanism
 
-## Deployment and use
+### Deployment and use
 
 
 ### Version Control
