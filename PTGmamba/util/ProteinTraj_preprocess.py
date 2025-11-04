@@ -158,40 +158,32 @@ def traj_preprocess(config, top_name, pdb_name, traj_name):
     print("生成刚性变换矩阵...")
     rigid_groups = build_rigid_transforms_optimized(atom_positions, aatype)
 
-    # 构建特征字典
+    
+    # 构建图特征
     chain_feats = {
         "rigidgroups_frames": rigid_groups,  # [T, N_res, 4, 4]
         "aatype": aatype,  # [T, N_res]
         "all_atom_positions": atom_positions,
         "all_atom_mask": all_atom_mask,
     }
-
-    # 计算扭转角
-    print("计算扭转角...")
     with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
         chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
     # 转换到Atom14表示
     chain_feats = au.atom37_to_atom14(chain_feats)
-
-    # 生成图特征
-    print("生成图特征...")
-    node_feat, edge_index, edge_attr = ut.build_frame_graph(chain_feats)
-
-    # 更新特征字典
-    chain_feats.update(
-        {
-            "atom_feat": node_feat,
-            "edge_index": edge_index,
-            "edge_attr": edge_attr,
-        }
-    )
-
     # 保存为pkl文件
     save_features(chain_feats, cache_file)
     print(f"预处理完成，总耗时: {time.time()-start_time:.2f}秒")
     print(f"特征已缓存到: {cache_file}")
 
-    return chain_feats
+    # 返回前转到CPU
+    cpu_feats = {}
+    for key, value in chain_feats.items():
+        if isinstance(value, torch.Tensor):
+            cpu_feats[key] = value.cpu()
+        else:
+            cpu_feats[key] = value
+    
+    return cpu_feats
 
 
 def save_features(features, file_path):
@@ -221,7 +213,3 @@ def load_features(file_path, device=None):
                 features[key] = value.to(device)
 
     return features
-
-
-# if __name__ == "__main__":
-#     traj_preprocess(config, "2ala", "2ala", "traj")

@@ -13,11 +13,13 @@ from util import *
 from Model.PTGmamba import ProteinTrajectoryModel
 from dataset import ProteinTrajectoryDataset, collate_fn
 import model_Config as cfg
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg') 
+
 
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="使用训练好的模型进行蛋白质轨迹预测")
-
     # 模型相关
     parser.add_argument(
         "--model_path", type=str, required=True, help="训练好的模型路径 (.pth)"
@@ -27,23 +29,43 @@ def parse_args():
     parser.add_argument("--p_Name", type=str, default="2ala", help="PDB名称")
     parser.add_argument("--top_Name", type=str, default="2ala", help="拓扑文件名")
     parser.add_argument("--traj_name", type=str, default="traj", help="轨迹文件名")
+    parser.add_argument(
+        "--output_dir", type=str, default="./predictions", help="保存路径"
+    )
+    
+
+    # 模型参数
+    parser.add_argument("--d_model", type=int, default=256, help="Mamba隐藏层维度")
+    parser.add_argument("--d_state", type=int, default=64, help="状态维度")
+    parser.add_argument("--n_layers", type=int, default=4, help="Mamba层数")
+    parser.add_argument("--depth", type=int, default=4, help="EGNN/IPA深度")
+
+    parser.add_argument("--dim", type=int, default=256, help="EGNN特征维度")
+    parser.add_argument("--edge_dim", type=int, default=64, help="EGNN边特征维度")
+    parser.add_argument("--file_id", type=int, default=4, help="文件ID")
 
     # 预测参数
-    parser.add_argument("--window_size", type=int, default=25, help="输入窗口大小")
-    parser.add_argument("--pred_steps", type=int, default=5, help="预测步数")
+    parser.add_argument("--window_size", type=int, default=20, help="输入窗口大小")
+    parser.add_argument("--pred_steps", type=int, default=20, help="预测步数")
     parser.add_argument("--max_samples", type=int, default=10, help="最大预测样本数")
-    parser.add_argument("--batch_size", type=int, default=8, help="批大小")
+    parser.add_argument("--stride", type=int, default=1, help="滑动步长")
+    parser.add_argument("--batch_size", type=int, default=16, help="批大小")
 
     return parser.parse_args()
 
 
 def load_trained_model(model_path, config, node_dim, edge_dim, N_res, valid_atom):
-    """加载训练好的模型"""
     model = ProteinTrajectoryModel(node_dim, edge_dim, N_res, valid_atom, config)
 
     # 加载模型权重
     checkpoint = torch.load(model_path, map_location=config.device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    state_dict = checkpoint["model_state_dict"]
+    
+    # 处理DataParallel保存的模型（移除"module."前缀）
+    if list(state_dict.keys())[0].startswith("module."):
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    
+    model.load_state_dict(state_dict)
     model = model.to(config.device)
     model.eval()
 
@@ -56,6 +78,60 @@ def load_trained_model(model_path, config, node_dim, edge_dim, N_res, valid_atom
     return model
 
 
+def calculate_rmsd(pred_coords, true_coords, mask):
+    """
+    计算RMSD (Root Mean Square Deviation)
+    
+    Args:
+        pred_coords: 预测坐标 [N_valid, 3]
+        true_coords: 真实坐标 [N_valid, 3]
+        mask: 原子掩码 [N_valid]
+    
+    Returns:
+        rmsd: RMSD值
+    """
+    # 只计算有效原子的RMSD
+    if mask.sum() == 0:
+        return 0.0
+    
+    diff = pred_coords[mask] - true_coords[mask]
+    squared_diff = (diff ** 2).sum(dim=-1)
+    rmsd = torch.sqrt(squared_diff.mean())
+    
+    return rmsd.item()
+
+
+def plot_rmsd_curve(rmsd_list, frame_indices, output_dir):
+    """
+    绘制RMSD曲线图
+    
+    Args:
+        rmsd_list: RMSD值列表
+        frame_indices: 帧索引列表
+        output_dir: 输出目录
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(frame_indices, rmsd_list, 'b-', linewidth=2, label='pred vs true')
+    plt.xlabel('frame index', fontsize=12)
+    plt.ylabel('RMSD (Å)', fontsize=12)
+    plt.title('RMSD', fontsize=14, fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=10)
+    plt.tight_layout()
+    
+    # 保存图像
+    output_path = os.path.join(output_dir, 'rmsd_curve.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"\nRMSD统计信息:")
+    print(f"  平均RMSD: {np.mean(rmsd_list):.4f} Å")
+    print(f"  最小RMSD: {np.min(rmsd_list):.4f} Å")
+    print(f"  最大RMSD: {np.max(rmsd_list):.4f} Å")
+    print(f"  标准差: {np.std(rmsd_list):.4f} Å")
+    print(f"RMSD曲线图已保存至: {output_path}")
+
+
 def predict(model, test_loader, config, output_dir, max_samples=5):
     """
     使用训练好的模型进行预测
@@ -65,7 +141,6 @@ def predict(model, test_loader, config, output_dir, max_samples=5):
         test_loader: 测试数据加载器
         config: 配置对象
         output_dir: 输出目录
-        max_frames_per_sample: 每个样本最大预测帧数
     """
     model.eval()
     os.makedirs(output_dir, exist_ok=True)
@@ -73,6 +148,10 @@ def predict(model, test_loader, config, output_dir, max_samples=5):
     total_predictions = 0
     sample_index = 0  # 样本索引（第几个样本）
     generated_samples = 0  # 已生成的样本数
+    
+    # 用于存储RMSD值
+    rmsd_list = []
+    frame_indices = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(test_loader, desc="预测中")):
@@ -81,12 +160,14 @@ def predict(model, test_loader, config, output_dir, max_samples=5):
                 for k, v in batch.items()
             }
 
-            # 前向传播
-            outputs = model(batch, pred_steps=config.pred_steps)
+            outputs = model(data=batch, pred_steps=config.pred_steps)
 
             # 获取预测坐标
             pred_pos = outputs["pred_coords"]  # [B, T, N_valid, 3]
 
+            # 获取真实坐标（用于计算RMSD）
+            true_coords = batch.get("coords_target", None)  # [B, T, N_valid, 3]
+            
             # 获取 aatype
             aatype = batch["aatype_target"]  # [B, T, N_res]
 
@@ -112,6 +193,14 @@ def predict(model, test_loader, config, output_dir, max_samples=5):
                     input_start_idx = input_start_indices[b]
                     output_start_idx = output_start_indices[b]
                     output_frame_idx = output_start_idx + t  # 具体输出帧索引
+                    
+                    # 计算RMSD（如果有真实坐标）
+                    if true_coords is not None:
+                        true_coords_flat = true_coords[b, t]  # [N_valid, 3]
+                        flat_mask = atom_mask_sample.reshape(-1).bool()
+                        rmsd = calculate_rmsd(pred_coords_flat, true_coords_flat, flat_mask)
+                        rmsd_list.append(rmsd)
+                        frame_indices.append(output_frame_idx.item() if isinstance(output_frame_idx, torch.Tensor) else output_frame_idx)
 
                     N_res = atom_mask_sample.shape[0]
                     full_coords = np.zeros((N_res, 14, 3), dtype=np.float32)
@@ -144,6 +233,11 @@ def predict(model, test_loader, config, output_dir, max_samples=5):
                 generated_samples += 1
 
     print(f"预测完成，共生成 {total_predictions} 个 PDB 文件")
+    
+    # 绘制RMSD曲线
+    if rmsd_list:
+        plot_rmsd_curve(rmsd_list, frame_indices, output_dir)
+    
     return total_predictions
 
 
@@ -159,25 +253,56 @@ def main():
     config.traj_name = args.traj_name
     config.window_size = args.window_size
     config.pred_steps = args.pred_steps
+    config.file_id = args.file_id
+
+    config.d_model = args.d_model
+    config.d_state = args.d_state
+    config.n_layers = args.n_layers
+    config.dim = args.dim
     config.batch_size = args.batch_size
-    config.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    config.stride = args.stride
 
     print("当前配置:")
     for key, value in vars(config).items():
         if not key.startswith("__") and not callable(value):
             print(f"  {key}: {value}")
 
-    # 数据预处理
-    print(f"开始预处理轨迹: {config.p_Name}")
+    # 使用验证集进行预测
+    print(f"\n使用验证集进行预测")
     feature_dict = traj_preprocess(
         config, config.top_Name, config.p_Name, config.traj_name
     )
-
-    # 创建数据集
+    
+    # 获取原始轨迹的总帧数
+    n_frames = feature_dict['all_atom_positions'].shape[0]
+    print(f"  原始轨迹总帧数: {n_frames}")
+    
+    # 划分训练集和验证集（与训练时保持一致：80%训练，20%验证）
+    train_frame_end = int(n_frames * 0.8)
+    val_frame_start = train_frame_end
+    
+    print(f"  训练帧: [0, {train_frame_end})  (前80%)")
+    print(f"  验证帧: [{val_frame_start}, {n_frames})  (后20%)")
+    
+    # 创建验证集的feature_dict（只取后20%）
+    val_feature_dict = {
+        'rigidgroups_frames': feature_dict['rigidgroups_frames'][val_frame_start:],
+        'all_atom_positions': feature_dict['all_atom_positions'][val_frame_start:],
+        'all_atom_mask': feature_dict['all_atom_mask'][val_frame_start:],
+        'aatype': feature_dict['aatype'][val_frame_start:],
+        'torsion_angles_sin_cos': feature_dict['torsion_angles_sin_cos'][val_frame_start:],
+        'torsion_angles_mask': feature_dict['torsion_angles_mask'][val_frame_start:],
+    }
+    
+    # 创建验证集数据集（传入正确的frame_offset）
     dataset = ProteinTrajectoryDataset(
-        feature_dict,
+        val_feature_dict,
         config,
+        is_train=False,
+        frame_offset=val_frame_start
     )
+    
+    print(f"  验证集样本数: {len(dataset)}")
 
     # 创建数据加载器
     test_loader = torch.utils.data.DataLoader(
@@ -185,15 +310,10 @@ def main():
         batch_size=config.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
     )
 
     # 获取维度信息
-    node_dim = dataset.atom_feat.shape[-1]
-    edge_dim = dataset.edge_attr.shape[-1]
-    N_res = dataset.all_atom_positions.shape[1]
-    atom_mask = dataset.all_atom_mask.reshape(len(dataset.all_atom_mask), -1).bool()
-    valid_atom = int(atom_mask.sum(dim=1)[0])
+    node_dim, edge_dim, N_res, valid_atom = dataset.get_feature_dim()
 
     # 加载模型
     model = load_trained_model(
@@ -201,13 +321,13 @@ def main():
     )
 
     # 开始预测
+    print(f"\n开始在验证集上进行预测...\n")
     predict(
         model,
         test_loader,
         config,
         args.output_dir,
         max_samples=args.max_samples,
-        max_frames_per_sample=args.max_frames_per_sample,
     )
 
 

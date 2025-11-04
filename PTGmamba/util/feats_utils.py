@@ -1,13 +1,12 @@
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation as R
+import torch.nn.functional as F
 from openfold.data import data_transforms
 import util.ProteinTraj_preprocess as tj
-import numpy as np
 import torch
 import torch.nn as nn
 import torch_scatter
-
+from scipy.spatial.transform import Rotation as R
 
 def filter_edges(edge_index, edge_attr, valid_nodes):
     # 创建有效节点映射表
@@ -28,20 +27,94 @@ def filter_edges(edge_index, edge_attr, valid_nodes):
 
 
 # 旋转矩阵转换为四元数
-def rot2quaternion(rotations):
-    if isinstance(rotations, torch.Tensor):
-        rotations = rotations.detach().cpu().numpy()
+def rot2quat(r):
+    """
+    将旋转矩阵转换为四元数（支持梯度）
+    输入: r [..., 3, 3]
+    输出: quaternions [..., 4] (w, x, y, z)
+    """
+    if isinstance(r, list):
+        r = torch.stack(r)
+    
+    original_shape = r.shape[:-2]
+    r = r.view(-1, 3, 3)
+    
+    q = torch.zeros(r.shape[0], 4, device=r.device, dtype=r.dtype)
+    
+    trace = r[:, 0, 0] + r[:, 1, 1] + r[:, 2, 2]
+    
+    # Case 1: trace > 0
+    mask_pos = trace > 0
+    if torch.any(mask_pos):
+        r_pos = r[mask_pos]
+        trace_pos = trace[mask_pos]
+        s = torch.sqrt(trace_pos + 1.0) * 2
+        q[mask_pos, 0] = 0.25 * s
+        q[mask_pos, 1] = (r_pos[:, 2, 1] - r_pos[:, 1, 2]) / s
+        q[mask_pos, 2] = (r_pos[:, 0, 2] - r_pos[:, 2, 0]) / s
+        q[mask_pos, 3] = (r_pos[:, 1, 0] - r_pos[:, 0, 1]) / s
+        
+    # Case 2, 3, 4
+    mask_neg = ~mask_pos
+    if torch.any(mask_neg):
+        r_neg = r[mask_neg]
+        i = torch.argmax(r_neg.diagonal(dim1=-2, dim2=-1), dim=-1)
+        
+        q_neg = torch.zeros(r_neg.shape[0], 4, device=r.device, dtype=r.dtype)
+        
+        # i == 0
+        mask_i0 = i == 0
+        if torch.any(mask_i0):
+            r_i0 = r_neg[mask_i0]
+            s = torch.sqrt(1.0 + r_i0[:, 0, 0] - r_i0[:, 1, 1] - r_i0[:, 2, 2]) * 2
+            q_neg[mask_i0, 1] = 0.25 * s
+            q_neg[mask_i0, 0] = (r_i0[:, 2, 1] - r_i0[:, 1, 2]) / s
+            q_neg[mask_i0, 2] = (r_i0[:, 0, 1] + r_i0[:, 1, 0]) / s
+            q_neg[mask_i0, 3] = (r_i0[:, 0, 2] + r_i0[:, 2, 0]) / s
 
-    rotations = rotations.reshape(-1, 3, 3)
-    r3 = R.from_matrix(rotations)
-    return r3.as_quat()
+        # i == 1
+        mask_i1 = i == 1
+        if torch.any(mask_i1):
+            r_i1 = r_neg[mask_i1]
+            s = torch.sqrt(1.0 + r_i1[:, 1, 1] - r_i1[:, 0, 0] - r_i1[:, 2, 2]) * 2
+            q_neg[mask_i1, 2] = 0.25 * s
+            q_neg[mask_i1, 0] = (r_i1[:, 0, 2] - r_i1[:, 2, 0]) / s
+            q_neg[mask_i1, 1] = (r_i1[:, 0, 1] + r_i1[:, 1, 0]) / s
+            q_neg[mask_i1, 3] = (r_i1[:, 1, 2] + r_i1[:, 2, 1]) / s
 
+        # i == 2
+        mask_i2 = i == 2
+        if torch.any(mask_i2):
+            r_i2 = r_neg[mask_i2]
+            s = torch.sqrt(1.0 + r_i2[:, 2, 2] - r_i2[:, 0, 0] - r_i2[:, 1, 1]) * 2
+            q_neg[mask_i2, 3] = 0.25 * s
+            q_neg[mask_i2, 0] = (r_i2[:, 1, 0] - r_i2[:, 0, 1]) / s
+            q_neg[mask_i2, 1] = (r_i2[:, 0, 2] + r_i2[:, 2, 0]) / s
+            q_neg[mask_i2, 2] = (r_i2[:, 1, 2] + r_i2[:, 2, 1]) / s
+
+        q[mask_neg] = q_neg
+
+    q = F.normalize(q, dim=-1)
+    return q.view(*original_shape, 4)
 
 # 四元数转旋转矩阵
-def quaternion2rot(quaternion):
-    r = R.from_quat(quaternion)  # 顺序为 (x, y, z, w)
-    return r.as_matrix()
+def quat2rot(quaternion):
+    """
+    将四元数转换为旋转矩阵（支持梯度）
+    输入: quaternion [..., 4] (w, x, y, z)
+    输出: rotation_matrix [..., 3, 3]
+    """
+    w, x, y, z = torch.unbind(quaternion, -1)
+    n = (w * w + x * x + y * y + z * z).sqrt()
+    w, x, y, z = w / n, x / n, y / n, z / n
 
+    R = torch.stack([
+        torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], dim=-1),
+        torch.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], dim=-1),
+        torch.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], dim=-1),
+    ], dim=-2)
+
+    return R
 
 def compute_local_basis(n_pos, ca_pos, c_pos):
     """
@@ -74,15 +147,18 @@ def compute_local_basis(n_pos, ca_pos, c_pos):
 
 
 # 连续距离被转化为离散特征向量，径向基
-class GaussianDistance:
-
-    def __init__(self, dmin=0.0, dmax=15.0, step=0.4, gamma=1.0):
-        self.centers = np.arange(dmin, dmax + step, step)
+class GaussianDistance(nn.Module):
+    def __init__(self, dmin=0.0, dmax_close=6.0, dmax_far=12.0, 
+                 step_close=0.3, step_far=0.8, gamma=1.0):
+        super().__init__()
+        close_centers = torch.arange(dmin, dmax_close + step_close, step_close)
+        far_centers = torch.arange(dmax_close + step_far, dmax_far + step_far, step_far)
+        
+        self.centers = nn.Parameter(torch.cat([close_centers, far_centers]), requires_grad=False)
         self.gamma = gamma
 
-    def expand(self, distances):
-        return np.exp(-self.gamma * (distances[..., None] - self.centers) ** 2)
-
+    def forward(self, distances):
+        return torch.exp(-self.gamma * (distances.unsqueeze(-1) - self.centers) ** 2)
 
 def get_pred_torsion(output, dataset, target):
     # 计算预测的二面角
@@ -100,120 +176,47 @@ def get_pred_torsion(output, dataset, target):
     chain_feats = tj.atom37_to_atom14(chain_feats)
     return chain_feats["torsion_angles_sin_cos"]
 
+def orthogonalize_rotation_matrix(R):
+    """
+    使用SVD正交化旋转矩阵，保持梯度。
+    """
+    original_shape = R.shape
+    R_flat = R.view(-1, 3, 3)
+    U, _, Vt = torch.linalg.svd(R_flat)
+    det = torch.det(U @ Vt)
+    Vt_det = Vt.clone()
+    Vt_det[:, -1, :] *= det.sign().unsqueeze(-1)
+    return (U @ Vt_det).view(original_shape)
+
 
 # 正交化逆标准化
 def denomal_rot_mat(dataset, frames):
-    # 矩阵正交化
-    def rotation_matrix(mats):
-        U, s, Vt = np.linalg.svd(mats)
-        det = np.linalg.det(U @ Vt)
-        S = np.eye(3)[None, :, :].repeat(U.shape[0], axis=0)
-        S[:, 2, 2] = np.sign(det)
-        return U @ S @ Vt
-
-    if isinstance(frames, torch.Tensor):
-        frames = frames.detach().cpu().numpy()
-    elif isinstance(frames, np.ndarray):
-        frames = frames
     pred_rot = frames[..., :3, :3]
-
-    original_shape = pred_rot.shape
-    pred_rot = pred_rot.reshape(-1, 3, 3)
-    pred_rot = rotation_matrix(pred_rot)
-    pred_rot = pred_rot.reshape(original_shape)
+    pred_rot = orthogonalize_rotation_matrix(pred_rot)
 
     pred_trans = frames[..., :3, 3]
     num_samples, pred_steps, N_res, _, _ = pred_rot.shape
 
     # 转换为旋转向量
-    pred_rot_mat = pred_rot.reshape(-1, 3, 3)
-    pred_rot_vec = R.from_matrix(pred_rot_mat).as_rotvec()
+    pred_rot_mat_np = pred_rot.detach().cpu().numpy().reshape(-1, 3, 3)
+    pred_rot_vec_np = R.from_matrix(pred_rot_mat_np).as_rotvec()
 
     norm_params = dataset.get_normalization_params()
     rot_mean, rot_std = norm_params["rot"]
     trans_mean, trans_std = norm_params["trans"]
 
     # Z-Score逆标准化
-    denorm_rot_vec = pred_rot_vec * rot_std + rot_mean
-
-    angles = np.linalg.norm(pred_rot_vec, axis=-1, keepdims=True)
-
-    denorm_angles = np.tan(angles / 2)  # 逆反正切变换
-
-    denorm_factor = 2 * np.tan(denorm_angles / 2) / (angles + 1e-8)
-
-    denorm_rot = denorm_rot_vec * denorm_factor
-
-    # 转换回旋转矩阵
-    denorm_rot_mat = R.from_rotvec(denorm_rot).as_matrix()
+    denorm_rot_vec_np = pred_rot_vec_np * rot_std + rot_mean
+    denorm_rot_mat_np = R.from_rotvec(denorm_rot_vec_np).as_matrix()
 
     # 重组维度
-    denorm_rot_mat = denorm_rot_mat.reshape(num_samples, pred_steps, N_res, 3, 3)
-    out_frames = np.zeros_like(frames)
+    denorm_rot_mat = torch.from_numpy(denorm_rot_mat_np).to(frames.device).view(num_samples, pred_steps, N_res, 3, 3)
+    
+    out_frames = torch.zeros_like(frames)
     out_frames[..., :3, :3] = denorm_rot_mat
     out_frames[..., :3, 3] = pred_trans * trans_std + trans_mean
     out_frames[..., 3, 3] = 1.0
-    # 打印旋转矩阵 min/max
-    flat_rot = out_frames[..., :3, :3].reshape(-1, 3)
-
-    # 打印平移向量 min/max
-    flat_trans = out_frames[..., :3, 3].reshape(-1, 3)
     return out_frames
-
-
-def create_adjacency_matrix(atom_positions, k, max_atoms=None):
-    """
-    创建蛋白质原子的邻接矩阵和距离矩阵
-
-    参数:
-    atom_positions: [N, 3] 原子3D位置数组
-    k: K近邻数量
-    max_atoms: 最大处理原子数(如果为None则处理所有原子)
-
-    返回:
-    tuple: (adj_matrix, dist_matrix, indices)
-        - adj_matrix: 邻接矩阵 [N', N']
-        - dist_matrix: 距离矩阵 [N', N']
-        - indices: 用于映射到原始原子的索引
-    """
-    if isinstance(atom_positions, torch.Tensor):
-        atom_positions = atom_positions.detach().cpu().numpy()
-
-    # 如果提供了mask，只使用有效原子
-    if len(atom_positions.shape) == 3:  # [N_res, 14, 3]
-        # 展平原子维度
-        flat_pos = atom_positions.reshape(-1, 3)
-        # 创建掩码（假设所有位置都有效）
-        flat_mask = np.ones(flat_pos.shape[0], dtype=bool)
-    elif len(atom_positions.shape) == 2:  # [N, 3]
-        flat_pos = atom_positions
-        flat_mask = np.ones(flat_pos.shape[0], dtype=bool)
-    else:
-        raise ValueError("Invalid atom positions shape")
-
-    # 只选择有效原子
-    valid_pos = flat_pos[flat_mask]
-    num_valid = len(valid_pos)
-
-    # 如果原子太多，随机抽样
-    if max_atoms is not None and num_valid > max_atoms:
-        indices = np.random.choice(num_valid, max_atoms, replace=False)
-        valid_pos = valid_pos[indices]
-        num_valid = max_atoms
-    else:
-        indices = np.arange(num_valid)
-
-    # 计算距离矩阵
-    dist_matrix = np.linalg.norm(valid_pos[:, None] - valid_pos[None, :], axis=-1)
-
-    # 创建邻接矩阵 (K近邻)
-    adj_matrix = np.zeros((num_valid, num_valid))
-    for i in range(num_valid):
-        # 获取最近的k个邻居（不包括自身）
-        neighbors = np.argsort(dist_matrix[i])[1 : k + 1]
-        adj_matrix[i, neighbors] = 1
-
-    return adj_matrix, dist_matrix, indices
 
 
 class AtomToResidue(nn.Module):
@@ -232,7 +235,6 @@ class AtomToResidue(nn.Module):
 
     def forward(self, atom_features, residue_indices, edge_index, edge_attr):
         """
-        批量处理版本
         输入:
         atom_features: 原子特征 [B, T, num_atoms, atom_feat_dim]
         residue_indices: 残基索引 [B, num_atoms]
@@ -258,67 +260,51 @@ class AtomToResidue(nn.Module):
         edge_index_flat = edge_index.reshape(B * T, 2, num_edges)
         edge_attr_flat = edge_attr.reshape(B * T, num_edges, edge_feat_dim)
 
-        # 1. 聚合每个残基的所有原子特征
-        # 使用最大池化聚合每个残基的特征
+        # 1. 识别Ca原子（每个残基的第1个原子，atom_type_idx=1）
+        # Ca原子在全局索引中的位置是 res_idx * 14 + 1
+        # 创建Ca原子的mask
+        ca_mask = torch.zeros(num_atoms, dtype=torch.bool, device=device)
+        ca_mask[self.ca_atom_type_idx::14] = True  # 每14个原子中的第1个（索引从0开始）
+        
+        # 提取Ca原子的索引和特征
+        ca_atom_indices = torch.where(ca_mask)[0]  # 在num_atoms中的索引
+        
+        # 初始化残基特征矩阵（只存储Ca特征）
         residue_node_features_flat = torch.zeros(
             B * T, num_res, atom_feat_dim, device=device
         )
+        
+        # Ca原子对应的残基索引（ca_atom_indices是1, 15, 29, ...对应残基0, 1, 2, ...）
+        ca_residue_indices = torch.div(ca_atom_indices, 14, rounding_mode='floor')
+        
+        # 提取Ca原子特征并直接赋值到对应残基
+        ca_features = atom_features_flat[:, ca_atom_indices, :]  # [B*T, num_ca, atom_feat_dim]
+        # 直接索引赋值（ca_residue_indices已经是正确的残基索引）
+        residue_node_features_flat[:, ca_residue_indices, :] = ca_features
+        
+        aggregated_features = residue_node_features_flat  # [B*T, num_res, atom_feat_dim]
 
-        # 为每个批次和时间步创建残基索引
-        batch_indices = (
-            torch.arange(B * T, device=device)
-            .unsqueeze(1)
-            .expand(-1, num_atoms)
-            .reshape(-1)
-        )
-        residue_indices_flat_expanded = residue_indices_flat.reshape(-1)
-
-        # 使用scatter_max进行批量聚合
-        aggregated_features, _ = torch_scatter.scatter_max(
-            atom_features_flat.reshape(-1, atom_feat_dim),
-            index=(batch_indices * num_res + residue_indices_flat_expanded),
-            dim=0,
-            dim_size=B * T * num_res,
-        )
-        aggregated_features = aggregated_features.reshape(B * T, num_res, atom_feat_dim)
-
-        # 2. 找到Ca原子
-        # 假设原子特征中有一个维度表示原子类型
-        ca_mask = torch.zeros_like(atom_features_flat[..., 0], dtype=torch.bool)
-        ca_mask[:, self.ca_atom_type_idx :: 14] = True  # 每14个原子中第1个是Ca原子
-
-        # 获取Ca原子的索引
-        ca_indices = torch.where(ca_mask)
-        ca_batch_indices = ca_indices[0]
-        ca_atom_indices = ca_indices[1]
-
-        # 3. 过滤边，只保留连接Ca原子的边
-        # 创建Ca原子映射表
-        ca_mapping = torch.full((B * T, num_atoms), -1, dtype=torch.long, device=device)
-        ca_mapping[ca_batch_indices, ca_atom_indices] = torch.arange(
-            len(ca_batch_indices), device=device
-        )
-
-        # 检查边的两端是否都是Ca原子
+        # 2. 找到Ca原子并过滤边
+        # 创建Ca原子映射表（原子索引 -> 是否是Ca）
         edge_src = edge_index_flat[:, 0, :]  # [B*T, num_edges]
         edge_dst = edge_index_flat[:, 1, :]  # [B*T, num_edges]
-
+        
         # 检查边的两端是否都是Ca原子
-        src_is_ca = ca_mapping.gather(1, edge_src) >= 0
-        dst_is_ca = ca_mapping.gather(1, edge_dst) >= 0
+        src_is_ca = ca_mask[edge_src]  # [B*T, num_edges]
+        dst_is_ca = ca_mask[edge_dst]  # [B*T, num_edges]
         ca_edge_mask = src_is_ca & dst_is_ca
-
+        
         # 获取有效的Ca边
         ca_edge_batch_indices = torch.where(ca_edge_mask)
         ca_edge_src = edge_src[ca_edge_batch_indices]
         ca_edge_dst = edge_dst[ca_edge_batch_indices]
-
+        
         # 获取对应的边特征
         ca_edge_attr = edge_attr_flat[
             ca_edge_batch_indices[0], ca_edge_batch_indices[1]
         ]
 
-        # 4. 投影特征
+        # 3. 投影特征
         atom_feats_proj = self.atom_feat_proj(
             aggregated_features
         )  # [B*T, num_res, residue_feat_dim]
@@ -326,19 +312,17 @@ class AtomToResidue(nn.Module):
             ca_edge_attr
         )  # [num_ca_edges, residue_feat_dim]
 
-        # 5. 创建残基级边特征矩阵
+        # 4. 创建残基级边特征矩阵
         residue_edge_features_flat = torch.zeros(
             B * T, num_res, num_res, self.residue_feat_dim, device=device
         )
 
-        # 获取Ca边对应的残基索引
-        ca_edge_batch_res_indices = ca_edge_batch_indices[0]  # 批次索引
-        ca_edge_src_res = residue_indices_flat[
-            ca_edge_batch_indices[0], ca_edge_src
-        ]  # 源残基索引
-        ca_edge_dst_res = residue_indices_flat[
-            ca_edge_batch_indices[0], ca_edge_dst
-        ]  # 目标残基索引
+        # 将Ca原子索引映射到残基索引
+        ca_edge_src_res = torch.div(ca_edge_src, 14, rounding_mode='floor')
+        ca_edge_dst_res = torch.div(ca_edge_dst, 14, rounding_mode='floor')
+        
+        # 获取Ca边对应的批次索引
+        ca_edge_batch_res_indices = ca_edge_batch_indices[0]
 
         # 组合特征
         src_feat = atom_feats_proj[ca_edge_batch_res_indices, ca_edge_src_res]
@@ -355,8 +339,8 @@ class AtomToResidue(nn.Module):
             ca_edge_batch_res_indices, ca_edge_dst_res, ca_edge_src_res
         ] = combined
 
-        # 6. 处理残基节点特征
-        residue_node_features_flat = self.atom_feat_proj(aggregated_features)
+        # 5. 处理残基节点特征（使用已投影的Ca特征）
+        residue_node_features_flat = atom_feats_proj  # 复用已投影的特征
 
         # 重塑回原始形状
         residue_edge_features = residue_edge_features_flat.reshape(

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=para_opti      ##作业名称
+#SBATCH --job-name=v11_2ala   ##作业名称
 #SBATCH --partition=bio                  ##作业申请的分区名称
 #SBATCH --nodes=1                        ##作业申请的节点数
 #SBATCH --ntasks-per-node=8             ##作业申请的每个节点使用的核心数
@@ -20,22 +20,97 @@
 # echo $SLURM_GPUS
 
 source activate mamba
-
-
 python ./main/run.py  --p_Name 2ala \
  --top_Name 2ala \
  --traj_name traj \
- --window_size 10 \
- --pred_step 5 \
+ --window_size 20 \
+ --pred_step 10\
+ --stride 1 \
  --batch_size 16 \
- --epochs 120 \
- --lr 1e-4 \
- --dropout 0.5 \
+ --epochs 500 \
+ --lr 2e-4 \
+ --dropout 0.1 \
  --d_model 256 \
  --d_state 64 \
- --n_layers 4 \
+ --n_layers 8 \
  --depth 4 \
  --dim 256 \
  --edge_dim 64 \
- --ver "test_3" \
+ --ver "v11" \
  --use_cache \
+ --mode mixed \
+ --use_random_window \
+
+# python overfit_test.py 2>&1 | tee overfit_test_$(date +%Y%m%d_%H%M%S).log
+# python test_simple_mse_loss.py 2>&1 | tee test_simple_mse_loss_$(date +%Y%m%d_%H%M%S).log
+# python fix_overfitting_issues.py 2>&1 | tee fix_overfitting_issues_$(date +%Y%m%d_%H%M%S).log
+# python test_gradient_flow.py 2>&1 | tee test_simple_mse_loss_$(date +%Y%m%d_%H%M%S).log
+
+# python train_with_improvements.py \
+#     --stride 1 \
+#     --epochs 200 \
+#     --batch_size 16 \
+#     --lr 0.0002 \
+#     --dropout 0.2 \
+#     --weight_decay 1e-4 \
+#     --max_grad_norm 10.0 \
+#     --scheduler onecycle \
+#     --early_stop_patience 50 \
+#     --ver improved_v1 \
+#     --mode mixed
+
+
+# 配置2: 小数据集抗过拟合（如果样本<1000）
+# python train_with_improvements.py \
+#     --stride 1 \
+#     --epochs 150 \
+#     --batch_size 8 \
+#     --lr 0.0001 \
+#     --dropout 0.4 \
+#     --weight_decay 5e-4 \
+#     --max_grad_norm 5.0 \
+#     --scheduler plateau \
+#     --early_stop_patience 30 \
+#     --ver improved_small \
+#     --mode mixed
+
+# 配置3: 更激进的学习率（如果训练太慢）
+# python train_with_improvements.py \
+#     --stride 1 \
+#     --epochs 200 \
+#     --batch_size 16 \
+#     --lr 0.0003 \
+#     --dropout 0.2 \
+#     --weight_decay 1e-4 \
+#     --max_grad_norm 10.0 \
+#     --scheduler onecycle \
+#     --ver improved_fast \
+#     --mode mixed
+
+# python ./main/predict.py \
+#     --p_Name 2ala \
+#     --top_Name 2ala \
+#     --traj_name prod1 \
+#     --window_size 20 \
+#     --pred_step 50 \
+#     --stride 50 \
+#     --batch_size 16 \
+#     --d_model 256 \
+#     --d_state 64 \
+#     --n_layers 4 \
+#     --depth 4 \
+#     --dim 256 \
+#     --edge_dim 64 \
+#     --model_path ./predictions/2ala_traj/4/mixed_epochs_400/best_model_rmsd.pth \
+#     --output_dir ./predictions/2ala_traj/pred_50 \
+
+# python ./main/predict_autoregressive.py \
+    # --model_path ./predictions/2ala_traj/4/mixed_lr_2e-4_200/best_model_rmsd.pth \
+    # --p_Name 2ala \
+    # --top_Name 2ala \
+    # --traj_name prod1 \
+    # --window_size 20 \
+    # --total_pred_steps 100 \
+    # --pred_step 20 \
+    # --start_frame 8200 \
+    # --output_dir ./predictions/2ala_traj_mixed_lr_2e-4_200/pred_100_5_20

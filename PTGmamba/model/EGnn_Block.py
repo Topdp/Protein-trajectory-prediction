@@ -1,108 +1,9 @@
 import math
-from egnn_pytorch import EGNN_Network
 import torch
-from torch_geometric.nn import global_mean_pool
 import torch.nn as nn
-import torch.nn.functional as F
-
-
-class MultiheadAttention(nn.Module):
-    def __init__(self, heads, d_model, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.d_k = d_model // heads  # 每个"头"对应的维度
-        self.h = heads  # "头"的数量
-
-        # 初始化线性层，用于生成 Q, K, V
-        self.q_linear = nn.Linear(d_model, d_model)
-        self.k_linear = nn.Linear(d_model, d_model)
-        self.v_linear = nn.Linear(d_model, d_model)
-
-        self.dropout = nn.Dropout(dropout)
-
-        # 输出线性层
-        self.out = nn.Linear(d_model, d_model)
-
-    def attention(self, q, k, v, mask=None):
-        # 计算分数，并通过 sqrt(d_k) 进行缩放
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-
-        # 如果有 mask，应用于 scores
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-
-        # 对 scores 应用 softmax
-        scores = F.softmax(scores, dim=-1)
-
-        # 应用 dropout
-        scores = self.dropout(scores)
-
-        # 获取输出
-        output = torch.matmul(scores, v)
-        return output
-
-    def forward(self, q, k, v, mask=None):
-        batch_size = q.size(0)
-
-        # 对 q, k, v 进行线性变换
-        q = self.q_linear(q).view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
-        k = self.k_linear(k).view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
-        v = self.v_linear(v).view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
-
-        # 进行多头注意力计算
-        scores = self.attention(q, k, v, mask)
-
-        # 将多个头拼接回单个向量
-        concat = scores.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-
-        # 通过输出线性层
-        output = self.out(concat)
-
-        return output
-
-
-class AttentionPooling(nn.Module):
-    def __init__(self, dim, num_heads=4, dropout=0.1):
-        super().__init__()
-        self.num_heads = num_heads
-        self.dim = dim
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
-
-        # 使用多头注意力层
-        self.multihead_attn = MultiheadAttention(num_heads, dim, dropout)
-
-        # 输出投影
-        self.out_proj = nn.Linear(dim, dim)
-
-    def forward(self, features, batch_idx):
-        """
-        features: [总节点数, 特征维度]
-        batch_idx: [总节点数] 表示每个节点所属的批次
-        """
-        # 为每个批次计算全局表示
-        unique_batches = torch.unique(batch_idx)
-        pooled_features = []
-
-        for batch_id in unique_batches:
-            # 获取当前批次的所有节点
-            mask = batch_idx == batch_id
-            batch_features = features[mask]
-
-            # 增加批次维度 [1, num_nodes, dim]
-            batch_features = batch_features.unsqueeze(0)
-
-            # 使用多头注意力
-            attn_output = self.multihead_attn(
-                batch_features, batch_features, batch_features
-            )
-
-            # 全局池化
-            pooled = torch.mean(attn_output, dim=1)  # [1, dim]
-            pooled = self.out_proj(pooled)
-            pooled_features.append(pooled)
-
-        return torch.cat(pooled_features, dim=0)
+import dgl
+from dgl.nn.pytorch import EGNNConv
+from torch_geometric.nn import global_mean_pool
 
 
 class ProteinEGNN(nn.Module):
@@ -111,66 +12,158 @@ class ProteinEGNN(nn.Module):
         self.config = config
         self.valid_atom = valid_atom
 
+        
         self.node_embed = nn.Linear(node_dim, config.dim)
         self.edge_embed = nn.Linear(edge_dim, config.edge_dim)
 
-        k = min(32, valid_atom - 1) if valid_atom > 1 else 0
-
-        self.egnn = EGNN_Network(
-            depth=config.depth,
-            dim=config.dim,
-            edge_dim=config.edge_dim,
-            m_dim=config.dim * 2,
-            fourier_features=config.fourier_features,
-            dropout=config.dropout,
-            norm_coors=True,
-            m_pool_method=config.m_pool_method,
-            update_coors=True,
-            global_linear_attn_every=1,
+        # EGNN层（几何等变卷积）
+        self.egnn_layers = nn.ModuleList(
+            [
+                EGNNConv(
+                    in_size=config.dim,
+                    hidden_size=config.dim * 2,
+                    out_size=config.dim,
+                    edge_feat_size=config.edge_dim,
+                )
+                for _ in range(config.depth)
+            ]
         )
+        
+        self.layer_norms = nn.ModuleList(
+            [nn.LayerNorm(config.dim) for _ in range(config.depth)]
+        )
+        
+        # 输出归一化：统一EGNN和IPA的输出尺度，确保特征融合平衡（必须保留）
+        self.output_norm = nn.LayerNorm(config.dim)
 
-        self.attention_pool = AttentionPooling(dim=self.config.dim, num_heads=4)
+    def build_sparse_graph(self, edge_index, node_feat, positions, edge_attr):
+        B, T, N_valid, _ = node_feat.shape
+        device = node_feat.device
+
+        if edge_index.dim() == 3:  # [T, 2, E]
+            edge_index = edge_index.unsqueeze(0).expand(B, -1, -1, -1)  # [B, T, 2, E]
+
+        total_nodes = B * T * N_valid
+        node_feat_flat = node_feat.view(total_nodes, -1)
+        positions_flat = positions.view(total_nodes, 3)
+
+        all_src = []
+        all_dst = []
+        all_edge_attr = []
+
+        for b in range(B):
+            for t in range(T):
+                cur_edge_index = edge_index[b, t]  # [2, E]
+                cur_edge_attr = edge_attr[b, t]  # [E, edge_dim]
+
+                # 使用原地逻辑运算（避免中间 bool 张量堆积）
+                valid_mask = (cur_edge_index[0] < N_valid) & (
+                    cur_edge_index[1] < N_valid
+                )
+                # 排除 (0,0) padding 边
+                zero_mask = (cur_edge_index[0] == 0) & (cur_edge_index[1] == 0)
+                valid_mask = valid_mask & (~zero_mask)
+
+                num_valid = valid_mask.sum().item()
+                if num_valid == 0:
+                    continue
+
+                # 直接索引，避免中间变量
+                valid_src = cur_edge_index[0][valid_mask]
+                valid_dst = cur_edge_index[1][valid_mask]
+                valid_attr = cur_edge_attr[valid_mask]
+
+                graph_offset = (b * T + t) * N_valid
+                # 原地加法（小张量，影响不大，但语义清晰）
+                valid_src = valid_src + graph_offset
+                valid_dst = valid_dst + graph_offset
+
+                all_src.append(valid_src)
+                all_dst.append(valid_dst)
+                all_edge_attr.append(valid_attr)
+
+        # 处理空边情况
+        if not all_src:
+            g = dgl.graph(
+                (
+                    torch.empty(0, dtype=torch.long, device=device),
+                    torch.empty(0, dtype=torch.long, device=device),
+                ),
+                num_nodes=total_nodes,
+                device=device,
+            )
+            g.ndata["h"] = node_feat_flat
+            g.ndata["x"] = positions_flat
+            return g, B, T, N_valid
+
+        src_indices = torch.cat(all_src, dim=0)
+        dst_indices = torch.cat(all_dst, dim=0)
+        edge_attr_cat = torch.cat(all_edge_attr, dim=0)
+
+        g = dgl.graph((src_indices, dst_indices), num_nodes=total_nodes, device=device)
+        g.ndata["h"] = node_feat_flat
+        g.ndata["x"] = positions_flat
+        g.edata["a"] = edge_attr_cat
+
+        return g, B, T, N_valid
 
     def forward(self, data):
-        device = next(self.parameters()).device
+        device = data["input_atom_feat"].device
 
         node_feat = data["input_atom_feat"].to(device)
         edge_index = data["input_edge_index"].to(device)
         edge_attr = data["input_edge_attr"].to(device)
         positions = data["input_atom_positions"].to(device)
         atom_mask = data["input_atom_mask"].to(device)
-        B, T, N, _ = node_feat.shape
 
-        node_feat = self.node_embed(node_feat)
-        edge_attr = self.edge_embed(edge_attr)
+        B, T, N_valid, _ = node_feat.shape
 
-        batch_size = B * T
-        node_feat_reshaped = node_feat.view(batch_size, N, -1)
-        valid_positions = positions.view(-1, 3)[atom_mask.view(-1).bool()]
-        valid_positions = valid_positions.reshape(batch_size, -1, 3)
+        # 直接嵌入（不需要输入归一化）
+        # 原因：后续的层归一化和输出归一化已经足够
+        node_feat = self.node_embed(node_feat)  # [B, T, N_valid, dim]
+        edge_attr = self.edge_embed(edge_attr)  # [B, T, E, edge_dim]
 
-        edge_feats_mat = torch.zeros(
-            (batch_size, N, N, edge_attr.size(-1)), device=device
+        atom_mask_flat = atom_mask.view(-1)
+        valid_positions = positions.view(-1, 3)[atom_mask_flat.bool()].view(
+            B, T, N_valid, 3
+        )
+        
+        g, B, T, N_valid = self.build_sparse_graph(
+            edge_index, node_feat, valid_positions, edge_attr
         )
 
-        for b in range(B):
-            for t in range(T):
-                cur_edge_index = edge_index[b, t]
-                cur_edge_attr = edge_attr[b, t]
-                idx = b * T + t
-                edge_feats_mat[idx, cur_edge_index[0], cur_edge_index[1]] = (
-                    cur_edge_attr
-                )
+        h = g.ndata["h"]
+        x = g.ndata["x"]
 
-        feats, _ = self.egnn(
-            feats=node_feat_reshaped,
-            coors=valid_positions,
-            edges=edge_feats_mat,
-        )
+        # EGNN层 + 层归一化 + 残差连接
+        for idx, layer in enumerate(self.egnn_layers):
+            h_residual = h  # 保存残差
+            
+            if g.number_of_edges() > 0:
+                h_new, x_new = layer(g, h, x, g.edata["a"])
+            else:
+                h_new, x_new = h, x
+            
+            # 归一化
+            h_new = self.layer_norms[idx](h_new)
+            
+            # 残差连接（第一层后开始）
+            if idx > 0:
+                h = h_new + h_residual
+            else:
+                h = h_new
+            
+            x = x_new
 
-        feats = feats.view(B * T * N, -1)
-        batch_idx = torch.arange(batch_size, device=device).repeat_interleave(N)
-        global_feat = self.attention_pool(feats, batch_idx)
+        batch_idx = torch.arange(B * T, device=h.device).repeat_interleave(N_valid)
+        h_flat = h.view(-1, h.size(-1))  # [B*T*N_valid, dim]
+        global_feat = global_mean_pool(h_flat, batch_idx)  # [B*T, dim]
         global_feat = global_feat.view(B, T, -1)
+        
+        # 输出归一化
+        global_feat = self.output_norm(global_feat)
 
-        return {"node_feat": feats, "global_feat": global_feat}
+        return {
+            "node_feat": h,  # [B*T*N_valid, dim]
+            "global_feat": global_feat,  # [B, T, dim]
+        }

@@ -79,7 +79,7 @@ def atom37_to_atom14(chain_feats):
 
 def coords_to_atom14(pred_coords, atom_mask):
     """
-    将预测的扁平坐标还原为 [B, T, N_res, 14, 3] 格式
+    将预测的展平坐标还原为 [B, T, N_res, 14, 3] 格式
 
     Args:
         pred_coords: [B, T, N_valid, 3] 预测的原子坐标
